@@ -12,7 +12,17 @@ import sqlite3
 from pathlib import Path
 
 
-CLASS_RE = re.compile(r"(?:\(|\b)([A-Z](?:-?[A-Z0-9]+){0,4})(?:\)|\b)")
+CLASS_RE = re.compile(r"Class\s*([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:\([^)]*\))?)")
+CLASS_TRAILING_PAREN_RE = re.compile(r"\(([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)\)\s*$")
+
+
+def find_class_name(text: str) -> str | None:
+    """'ClassA-G' 형식과 '오프라인(A-E)'처럼 괄호로 끝나는 형식을 모두 지원한다."""
+    match = CLASS_RE.search(text)
+    if match:
+        return match.group(1)
+    match = CLASS_TRAILING_PAREN_RE.search(text)
+    return match.group(1) if match else None
 NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 SEPARATOR_RE = re.compile(r"^\s*:?-{3,}:?\s*$")
 
@@ -68,8 +78,19 @@ def extract_rows(table_text: str) -> list[tuple[str, str, str, float | None, str
     if len(rows) < 2:
         return []
 
-    # PDF 표는 다단 헤더가 많다. 상단 3행을 합쳐 지표 열을 찾는다.
-    header_rows = rows[: min(3, len(rows))]
+    # PDF 표는 다단 헤더가 많고 깊이도 표마다 다르다.
+    # 고정 행수 대신, 클래스명이 처음 등장하는 행을 데이터 시작점으로 삼는다.
+    header_rows = []
+    data_start = None
+    for index, row in enumerate(rows):
+        if row and find_class_name(row[0]):
+            data_start = index
+            break
+        header_rows.append(row)
+
+    if data_start is None or not header_rows:
+        return []
+
     width = max(map(len, header_rows))
     headers = [" ".join(row[index] for row in header_rows if index < len(row)) for index in range(width)]
     metrics = metric_columns(headers)
@@ -77,25 +98,23 @@ def extract_rows(table_text: str) -> list[tuple[str, str, str, float | None, str
         return []
 
     facts = []
-    for row in rows[1:]:
+    for row in rows[data_start:]:
         if not row:
             continue
-        class_match = CLASS_RE.search(row[0])
-        if not class_match:
+        class_name = find_class_name(row[0])
+        if not class_name:
             continue
-        class_name = class_match.group(1)
         for index, metric in metrics.items():
             if index >= len(row):
                 continue
-            raw_value = row[index].replace(",", "").strip()
+            raw_value = row[index].strip()
             if not raw_value or raw_value == "-":
                 continue
-            numeric_value = float(raw_value) if NUMBER_RE.fullmatch(raw_value) else None
+            parsed_value = raw_value.replace(",", "").replace("%", "").strip()
+            numeric_value = float(parsed_value) if NUMBER_RE.fullmatch(parsed_value) else None
             confidence = "high" if numeric_value is not None else "needs_review"
             facts.append((class_name, metric, raw_value, numeric_value, confidence))
     return facts
-
-
 def initialize_db(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
