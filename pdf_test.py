@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import json
 import os
 import re
@@ -8,22 +9,34 @@ from collections import Counter
 import pymupdf4llm
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
-OUTPUT_PATH = "processed_chunks.jsonl"
+OUTPUT_PATH = os.environ.get("RAG_OUTPUT_PATH", "processed_chunks.jsonl")
+MANIFEST_PATH = os.environ.get("RAG_MANIFEST_PATH", "processing_manifest.jsonl")
 
 
 # ── 파일 타입별 텍스트 추출 ──────────────────────────────────
 
-def get_markdown_text(file_path: str) -> str:
-    """파일 확장자에 따라 적절한 방법으로 마크다운 텍스트 추출"""
+def get_markdown_pages(file_path: str) -> list[tuple[int | None, str]]:
+    """문서를 페이지 단위 Markdown으로 추출한다.
+
+    PDF는 페이지 번호를 유지해야 답변 근거를 원문 페이지까지 연결할 수 있다.
+    DOCX는 페이지 경계가 보장되지 않으므로 ``None``으로 기록한다.
+    """
     ext = file_path.lower().rsplit('.', 1)[-1]
     if ext == 'pdf':
-        return pymupdf4llm.to_markdown(file_path)
+        import fitz
+
+        with fitz.open(file_path) as document:
+            page_count = len(document)
+        return [
+            (page_index + 1, pymupdf4llm.to_markdown(file_path, pages=[page_index]))
+            for page_index in range(page_count)
+        ]
     elif ext == 'docx':
         result = subprocess.run(
             ['pandoc', '-t', 'markdown', file_path],
             capture_output=True, text=True, check=True
         )
-        return result.stdout
+        return [(None, result.stdout)]
     else:
         raise ValueError(f"지원하지 않는 파일 형식: {ext}")
 
@@ -75,6 +88,34 @@ def remove_repeated_boilerplate_lines(full_text: str, min_occurrences: int = 3, 
     boilerplate = {l for l, c in counts.items() if c >= min_occurrences and len(l) <= max_len}
     cleaned = [l for l in lines if l.strip() not in boilerplate]
     return '\n'.join(cleaned)
+
+
+def repeated_boilerplate_lines(full_text: str, min_occurrences: int = 3, max_len: int = 60) -> set[str]:
+    """문서 전체에서 반복되는 짧은 러닝헤더 후보를 반환한다."""
+    counts = Counter(line.strip() for line in full_text.split('\n') if line.strip())
+    return {
+        line for line, count in counts.items()
+        if count >= min_occurrences and len(line) <= max_len
+    }
+
+
+def remove_lines(text: str, lines_to_remove: set[str]) -> str:
+    return '\n'.join(
+        line for line in text.split('\n')
+        if line.strip() not in lines_to_remove
+    )
+
+
+REFERENCE_DATE_RE = re.compile(
+    r'(?:작성기준일|기준일|작성일|시행일)\s*[:：]?\s*'
+    r'((?:20)?\d{2}[.년/-]\s*\d{1,2}[.월/-]\s*\d{1,2}(?:일)?)'
+)
+
+
+def extract_reference_date(md_text: str) -> str | None:
+    """문서에서 작성·기준일 후보를 추출한다. 확정 파싱은 후속 단계에서 보완한다."""
+    match = REFERENCE_DATE_RE.search(md_text[:10000])
+    return match.group(1).strip() if match else None
 
 
 # '#'이 최소 1개 이상 있어야 매칭 (목차 안의 순수 텍스트는 헤더로 오인하지 않도록)
@@ -131,6 +172,22 @@ def is_meaningless_chunk(text: str, min_len: int = 15) -> bool:
     return len(stripped) < 3 or len(text.strip()) < min_len
 
 
+def normalized_content_hash(text: str) -> str:
+    """서식 차이를 제거한 본문 해시. 문서 간 보일러플레이트 비교에 사용한다."""
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def is_global_boilerplate_candidate(chunk: dict) -> bool:
+    """표·짧은 답변은 보존하고, 반복되는 투자설명서 산문만 전역 중복 제거한다."""
+    metadata = chunk["metadata"]
+    return (
+        metadata.get("doc_type") == "product_prospectus"
+        and metadata.get("block_type") == "prose"
+        and len(chunk["page_content"]) >= 80
+    )
+
+
 # ── 문서 타입 분류 ──────────────────────────────────────────
 
 PROSPECTUS_KEYWORDS = ["투자설명서", "집합투자기구", "위험등급", "집합투자증권", "판매수수료"]
@@ -148,10 +205,17 @@ docx_files = glob.glob("**/*.docx", recursive=True)
 all_files = sorted(pdf_files + docx_files)
 
 done_files = set()
+seen_boilerplate_hashes = {}
 if os.path.exists(OUTPUT_PATH):
     with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
         for line in f:
-            done_files.add(json.loads(line)["metadata"]["source_file"])
+            existing_chunk = json.loads(line)
+            done_files.add(existing_chunk["metadata"]["source_file"])
+            if is_global_boilerplate_candidate(existing_chunk):
+                seen_boilerplate_hashes.setdefault(
+                    normalized_content_hash(existing_chunk["page_content"]),
+                    existing_chunk["metadata"]["source_file"],
+                )
 
 all_files = [p for p in all_files if p not in done_files]
 print(f"총 {len(all_files)}개 파일 처리 예정 (이미 완료: {len(done_files)}개 스킵)\n")
@@ -161,59 +225,88 @@ markdown_splitter = MarkdownHeaderTextSplitter(
 )
 char_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 
-with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f:
+with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f, open(
+    MANIFEST_PATH, "a", encoding="utf-8"
+) as manifest_f:
     for file_path in all_files:
-        print(f"📄 처리 중인 파일: {file_path}")
+        print(f"처리 중인 파일: {file_path}")
         try:
-            md_text = get_markdown_text(file_path)
-            if not md_text or not md_text.strip():
-                print(f"   ⚠️ 텍스트 추출 실패, 건너뜀")
+            raw_pages = get_markdown_pages(file_path)
+            raw_document_text = "\n".join(text for _, text in raw_pages)
+            if not raw_document_text or not raw_document_text.strip():
+                print("   경고: 텍스트 추출 실패, 건너뜀")
+                manifest_f.write(json.dumps({
+                    "source_file": file_path, "status": "skipped_empty",
+                    "pages_total": len(raw_pages), "chunks_generated": 0,
+                }, ensure_ascii=False) + "\n")
                 continue
 
-            if is_junk_extraction(md_text):
-                print(f"   ⚠️ 추출된 내용이 거의 없음 (스캔본/이미지 PDF 의심, OCR 필요) — 건너뜀")
+            if is_junk_extraction(raw_document_text):
+                print("   경고: 추출된 내용이 거의 없음 (스캔본/이미지 PDF 의심, OCR 필요) — 건너뜀")
+                manifest_f.write(json.dumps({
+                    "source_file": file_path, "status": "skipped_needs_ocr",
+                    "pages_total": len(raw_pages), "chunks_generated": 0,
+                }, ensure_ascii=False) + "\n")
                 continue
 
-            # 클리닝 단계 (분할 전, 문서 전체 단위로 수행)
-            md_text = strip_html_tags(md_text)
-            md_text = remove_picture_text_blocks(md_text)
-            md_text = remove_ocr_artifact_lines(md_text)
-            md_text = remove_repeated_boilerplate_lines(md_text)
-            md_text = normalize_part_headers(md_text)
-
-            doc_type = classify_doc(md_text)
-
-            header_chunks = markdown_splitter.split_text(md_text)
-
+            document_text = normalize_part_headers(
+                remove_ocr_artifact_lines(
+                    remove_picture_text_blocks(strip_html_tags(raw_document_text))
+                )
+            )
+            doc_type = classify_doc(document_text)
+            reference_date = extract_reference_date(document_text)
+            boilerplate = repeated_boilerplate_lines(document_text)
             file_chunks = []
-            for header_chunk in header_chunks:
-                blocks = split_tables_and_prose(header_chunk.page_content)
+            for page_number, raw_page_text in raw_pages:
+                page_text = normalize_part_headers(
+                    remove_lines(
+                        remove_ocr_artifact_lines(
+                            remove_picture_text_blocks(strip_html_tags(raw_page_text))
+                        ),
+                        boilerplate,
+                    )
+                )
+                if not page_text.strip() or is_junk_extraction(page_text):
+                    continue
 
-                prose_buffer = []
-                for block in blocks:
-                    if block["type"] == "table" and not looks_like_fake_table(block["content"]):
-                        if block["content"].strip():
-                            file_chunks.append({
-                                "page_content": block["content"].strip(),
-                                "metadata": {**header_chunk.metadata, "block_type": "table"},
-                            })
-                    else:
-                        # 표가 아니거나(fake table) 산문이면 산문 버퍼로
-                        prose_buffer.append(block["content"])
+                for header_chunk in markdown_splitter.split_text(page_text):
+                    blocks = split_tables_and_prose(header_chunk.page_content)
+                    prose_buffer = []
+                    for block in blocks:
+                        if block["type"] == "table" and not looks_like_fake_table(block["content"]):
+                            if block["content"].strip():
+                                file_chunks.append({
+                                    "page_content": block["content"].strip(),
+                                    "metadata": {
+                                        **header_chunk.metadata,
+                                        "block_type": "table",
+                                        "page_number": page_number,
+                                    },
+                                })
+                        else:
+                            prose_buffer.append(block["content"])
 
-                prose_text = "\n".join(prose_buffer).strip()
-                if prose_text:
-                    sub_chunks = char_splitter.split_text(prose_text)
-                    for sub in sub_chunks:
-                        if sub.strip():
-                            file_chunks.append({
-                                "page_content": sub.strip(),
-                                "metadata": {**header_chunk.metadata, "block_type": "prose"},
-                            })
+                    prose_text = "\n".join(prose_buffer).strip()
+                    if prose_text:
+                        for sub in char_splitter.split_text(prose_text):
+                            if sub.strip():
+                                file_chunks.append({
+                                    "page_content": sub.strip(),
+                                    "metadata": {
+                                        **header_chunk.metadata,
+                                        "block_type": "prose",
+                                        "page_number": page_number,
+                                    },
+                                })
 
             for chunk in file_chunks:
                 chunk["metadata"]["source_file"] = file_path
                 chunk["metadata"]["doc_type"] = doc_type
+                chunk["metadata"]["category"] = (
+                    "상품" if doc_type == "product_prospectus" else "제도"
+                )
+                chunk["metadata"]["작성기준일"] = reference_date
 
                 # 메타데이터의 헤더 값에서 ** 마크업 제거
                 for k in ("대분류", "중분류", "소분류"):
@@ -232,16 +325,42 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f:
                 if c["page_content"].strip() and not is_meaningless_chunk(c["page_content"])
             ]
 
+            kept_chunks = []
+            duplicate_chunks_removed = 0
             for chunk in file_chunks:
+                if is_global_boilerplate_candidate(chunk):
+                    content_hash = normalized_content_hash(chunk["page_content"])
+                    first_source = seen_boilerplate_hashes.get(content_hash)
+                    if first_source and first_source != file_path:
+                        duplicate_chunks_removed += 1
+                        continue
+                    seen_boilerplate_hashes.setdefault(content_hash, file_path)
+                kept_chunks.append(chunk)
+
+            for chunk in kept_chunks:
                 out_f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
             out_f.flush()
+            manifest_f.write(json.dumps({
+                "source_file": file_path,
+                "status": "success",
+                "doc_type": doc_type,
+                "pages_total": len(raw_pages),
+                "pages_with_text": len({c["metadata"]["page_number"] for c in kept_chunks}),
+                "chunks_generated": len(kept_chunks),
+                "duplicate_chunks_removed": duplicate_chunks_removed,
+            }, ensure_ascii=False) + "\n")
+            manifest_f.flush()
 
-            n_table = sum(1 for c in file_chunks if c['metadata']['block_type'] == 'table')
-            n_prose = sum(1 for c in file_chunks if c['metadata']['block_type'] == 'prose')
-            print(f"   └ 성공! {len(file_chunks)}개 덩어리 생성됨 ({doc_type} / 표 {n_table}개 / 산문 {n_prose}개)")
+            n_table = sum(1 for c in kept_chunks if c['metadata']['block_type'] == 'table')
+            n_prose = sum(1 for c in kept_chunks if c['metadata']['block_type'] == 'prose')
+            print(f"   성공: {len(kept_chunks)}개 덩어리 생성됨 ({doc_type} / 표 {n_table}개 / 산문 {n_prose}개 / 전역 중복 제거 {duplicate_chunks_removed}개)")
 
         except Exception as e:
-            print(f"   ❌ 파싱 에러 발생으로 해당 파일은 스킵합니다 ({file_path}): {e}")
+            print(f"   오류: 파싱 에러로 해당 파일을 스킵합니다 ({file_path}): {e}")
+            manifest_f.write(json.dumps({
+                "source_file": file_path, "status": "error", "error": str(e),
+            }, ensure_ascii=False) + "\n")
+            manifest_f.flush()
             continue
 
-print(f"\n✨ 완료! '{OUTPUT_PATH}'에 저장되었습니다.")
+print(f"\n완료: '{OUTPUT_PATH}'에 저장되었습니다.")

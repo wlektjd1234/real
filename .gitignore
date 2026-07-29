@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+product_facts.sqlite
+processing_manifest.jsonl
+.venv/
