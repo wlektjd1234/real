@@ -20,16 +20,17 @@ def get_markdown_pages(file_path: str) -> list[tuple[int | None, str]]:
 
     PDF는 페이지 번호를 유지해야 답변 근거를 원문 페이지까지 연결할 수 있다.
     DOCX는 페이지 경계가 보장되지 않으므로 ``None``으로 기록한다.
+
+    PDF는 페이지마다 pymupdf4llm.to_markdown()을 개별 호출하는 대신
+    page_chunks=True로 한 번에 처리한다. 페이지 수만큼 파일을 반복해서
+    새로 열고 파싱하던 구조를 없애 대형 투자설명서에서 체감 속도를 줄인다.
     """
     ext = file_path.lower().rsplit('.', 1)[-1]
     if ext == 'pdf':
-        import fitz
-
-        with fitz.open(file_path) as document:
-            page_count = len(document)
+        pages = pymupdf4llm.to_markdown(file_path, page_chunks=True)
         return [
-            (page_index + 1, pymupdf4llm.to_markdown(file_path, pages=[page_index]))
-            for page_index in range(page_count)
+            (page.get("metadata", {}).get("page", index) + 1, page.get("text", ""))
+            for index, page in enumerate(pages)
         ]
     elif ext == 'docx':
         result = subprocess.run(
@@ -39,12 +40,6 @@ def get_markdown_pages(file_path: str) -> list[tuple[int | None, str]]:
         return [(None, result.stdout)]
     else:
         raise ValueError(f"지원하지 않는 파일 형식: {ext}")
-
-
-def is_junk_extraction(md_text: str, min_meaningful_chars: int = 50) -> bool:
-    """텍스트 추출이 사실상 실패했는지 판별 (스캔본/이미지 PDF 의심 - 특수문자/공백만 있는 경우)"""
-    meaningful = re.sub(r'[\s\|\-∙·:*#\[\]<>br/]+', '', md_text)
-    return len(meaningful) < min_meaningful_chars
 
 
 # ── 클리닝 함수들 ──────────────────────────────────────────
@@ -111,6 +106,14 @@ REFERENCE_DATE_RE = re.compile(
     r'((?:20)?\d{2}[.년/-]\s*\d{1,2}[.월/-]\s*\d{1,2}(?:일)?)'
 )
 
+FUND_CODE_RE = re.compile(r'\bKR\d{10}\b')
+
+def extract_fund_code(file_path: str) -> str | None:
+    """source_file 경로에서 표준 펀드코드(예: KR5118201004)를 추출한다.
+    폴더/파일명에 코드가 없으면 None. API 서버 쪽 product_kb 연결 시
+    이 fund_code를 product_facts.sqlite의 source_file과 매칭하는 키로 쓴다."""
+    match = FUND_CODE_RE.search(file_path)
+    return match.group(0) if match else None
 
 def extract_reference_date(md_text: str) -> str | None:
     """문서에서 작성·기준일 후보를 추출한다. 확정 파싱은 후속 단계에서 보완한다."""
@@ -249,13 +252,18 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f, open(
                 }, ensure_ascii=False) + "\n")
                 continue
 
-            document_text = normalize_part_headers(
+document_text = normalize_part_headers(
                 remove_ocr_artifact_lines(
                     remove_picture_text_blocks(strip_html_tags(raw_document_text))
                 )
             )
             doc_type = classify_doc(document_text)
-            reference_date = extract_reference_date(document_text)
+            fund_code = extract_fund_code(file_path)
+            # 문서 앞부분(첫 10000자)에서 찾은 기준일을 기본값으로 삼되,
+            # 페이지를 넘어가며 새 기준일이 나오면 그 시점부터 최신 값으로 갱신한다.
+            # 멀티펀드 통합 투자설명서에서 섹션(펀드/클래스)마다 작성기준일이
+            # 다시 명시되는 경우를 반영하기 위함이다.
+            current_reference_date = extract_reference_date(document_text)
             boilerplate = repeated_boilerplate_lines(document_text)
             file_chunks = []
             for page_number, raw_page_text in raw_pages:
@@ -270,6 +278,10 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f, open(
                 if not page_text.strip() or is_junk_extraction(page_text):
                     continue
 
+                page_reference_date = extract_reference_date(page_text)
+                if page_reference_date:
+                    current_reference_date = page_reference_date
+
                 for header_chunk in markdown_splitter.split_text(page_text):
                     blocks = split_tables_and_prose(header_chunk.page_content)
                     prose_buffer = []
@@ -282,6 +294,7 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f, open(
                                         **header_chunk.metadata,
                                         "block_type": "table",
                                         "page_number": page_number,
+                                        "작성기준일": current_reference_date,
                                     },
                                 })
                         else:
@@ -297,6 +310,7 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f, open(
                                         **header_chunk.metadata,
                                         "block_type": "prose",
                                         "page_number": page_number,
+                                        "작성기준일": current_reference_date,
                                     },
                                 })
 
@@ -306,7 +320,7 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as out_f, open(
                 chunk["metadata"]["category"] = (
                     "상품" if doc_type == "product_prospectus" else "제도"
                 )
-                chunk["metadata"]["작성기준일"] = reference_date
+                chunk["metadata"]["fund_code"] = fund_code
 
                 # 메타데이터의 헤더 값에서 ** 마크업 제거
                 for k in ("대분류", "중분류", "소분류"):
